@@ -1,0 +1,11 @@
+{
+  "test_validation_mode": "subset",
+  "validation_test_files": [
+    "tests/unit/test_python314_support.py",
+    "tests/unit/test_dto",
+    "tests/unit/test_openapi",
+    "tests/unit/test_signature"
+  ],
+  "validation_test_file_count": 4,
+  "validation_tests_executed": null
+}

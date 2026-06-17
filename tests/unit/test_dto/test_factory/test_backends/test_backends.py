@@ -1,0 +1,678 @@
+from __future__ import annotations
+
+import inspect
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from types import ModuleType
+from typing import TYPE_CHECKING, Optional
+from unittest.mock import MagicMock
+
+import msgspec
+import pytest
+from msgspec import Meta, Struct, to_builtins
+
+from litestar import Litestar, Request, get, post
+from litestar._openapi.schema_generation import SchemaCreator
+from litestar.dto import DataclassDTO, DTOConfig, DTOField, MsgspecDTO
+from litestar.dto._backend import DTOBackend, _create_struct_field_meta_for_field_definition
+from litestar.dto._codegen_backend import DTOCodegenBackend
+from litestar.dto._types import CollectionType, SimpleType, TransferDTOFieldDefinition
+from litestar.dto.data_structures import DTOFieldDefinition
+from litestar.enums import MediaType
+from litestar.exceptions import SerializationException
+from litestar.openapi.spec.example import Example
+from litestar.openapi.spec.reference import Reference
+from litestar.openapi.spec.schema import Schema
+from litestar.params import KwargDefinition
+from litestar.serialization import encode_json
+from litestar.testing import RequestFactory
+from litestar.typing import FieldDefinition
+
+if TYPE_CHECKING:
+    from typing import Any
+
+
+@dataclass
+class NestedDC:
+    a: int
+    b: str
+
+
+@dataclass
+class OptionalNestedInner:
+    value: str
+
+
+@dataclass
+class OptionalNestedOuter:
+    name: str
+    inner: Optional[OptionalNestedInner] = None
+
+
+@dataclass
+class DC:
+    a: int
+    nested: NestedDC
+    nested_list: list[NestedDC]
+    nested_mapping: dict[str, NestedDC]
+    integer: int
+    b: str = field(default="b")
+    c: list[int] = field(default_factory=list)
+    optional: Optional[str] = None
+
+
+DESTRUCTURED = {
+    "a": 1,
+    "b": "b",
+    "c": [],
+    "nested": {"a": 1, "b": "two"},
+    "nested_list": [{"a": 1, "b": "two"}],
+    "nested_mapping": {"a": {"a": 1, "b": "two"}},
+    "integer": 1,
+    "optional": None,
+}
+RAW = b'{"a":1,"nested":{"a":1,"b":"two"},"nested_list":[{"a":1,"b":"two"}],"nested_mapping":{"a":{"a":1,"b":"two"}},"integer":1,"b":"b","c":[],"optional":null}'
+MSGPACK_RAW = b"\x88\xa1a\x01\xa6nested\x82\xa1a\x01\xa1b\xa3two\xabnested_list\x91\x82\xa1a\x01\xa1b\xa3two\xaenested_mapping\x81\xa1a\x82\xa1a\x01\xa1b\xa3two\xa7integer\x01\xa1b\xa1b\xa1c\x90\xa8optional\xc0"
+COLLECTION_RAW = b'[{"a":1,"nested":{"a":1,"b":"two"},"nested_list":[{"a":1,"b":"two"}],"nested_mapping":{"a":{"a":1,"b":"two"}},"integer":1,"b":"b","c":[],"optional":null}]'
+STRUCTURED = DC(
+    a=1,
+    b="b",
+    c=[],
+    nested=NestedDC(a=1, b="two"),
+    nested_list=[NestedDC(a=1, b="two")],
+    nested_mapping={"a": NestedDC(a=1, b="two")},
+    optional=None,
+    integer=1,
+)
+
+
+@pytest.fixture(name="dto_factory")
+def fx_backend_factory(use_experimental_dto_backend: bool) -> type[DataclassDTO]:
+    class Factory(DataclassDTO):
+        config = DTOConfig(experimental_codegen_backend=use_experimental_dto_backend)
+        model_type = DC
+
+    return Factory
+
+
+@pytest.fixture(name="asgi_connection")
+def fx_asgi_connection() -> Request[Any, Any, Any]:
+    @get("/", name="handler_id", media_type=MediaType.JSON)
+    def _handler() -> None: ...
+
+    return RequestFactory().get(path="/", route_handler=_handler)
+
+
+def test_backend_parse_raw_json(
+    dto_factory: type[DataclassDTO], asgi_connection: Request[Any, Any, Any], backend_cls: type[DTOBackend]
+) -> None:
+    assert (
+        to_builtins(
+            backend_cls(
+                dto_factory=dto_factory,
+                field_definition=FieldDefinition.from_annotation(DC),
+                model_type=DC,
+                wrapper_attribute_name=None,
+                is_data_field=True,
+                handler_id="test",
+            ).parse_raw(RAW, asgi_connection)
+        )
+        == DESTRUCTURED
+    )
+
+
+def test_backend_parse_raw_msgpack(dto_factory: type[DataclassDTO], backend_cls: type[DTOBackend]) -> None:
+    @get("/", name="handler_id", media_type=MediaType.MESSAGEPACK)
+    def _handler() -> None: ...
+
+    asgi_connection = RequestFactory().get(
+        path="/", route_handler=_handler, headers={"Content-Type": MediaType.MESSAGEPACK}
+    )
+    assert (
+        to_builtins(
+            backend_cls(
+                dto_factory=dto_factory,
+                field_definition=FieldDefinition.from_annotation(DC),
+                model_type=DC,
+                wrapper_attribute_name=None,
+                is_data_field=True,
+                handler_id="test",
+            ).parse_raw(MSGPACK_RAW, asgi_connection)
+        )
+        == DESTRUCTURED
+    )
+
+
+def test_backend_parse_unsupported_media_type(
+    dto_factory: type[DataclassDTO], asgi_connection: Request[Any, Any, Any], backend_cls: type[DTOBackend]
+) -> None:
+    @get("/", name="handler_id", media_type="text/css")
+    def _handler() -> None: ...
+
+    asgi_connection = RequestFactory().get(path="/", route_handler=_handler, headers={"Content-Type": "text/css"})
+
+    with pytest.raises(SerializationException):
+        backend_cls(
+            dto_factory=dto_factory,
+            field_definition=FieldDefinition.from_annotation(DC),
+            model_type=DC,
+            wrapper_attribute_name=None,
+            is_data_field=True,
+            handler_id="test",
+        ).parse_raw(b"", asgi_connection)
+
+
+def test_backend_iterable_annotation(dto_factory: type[DataclassDTO], backend_cls: type[DTOBackend]) -> None:
+    backend = DTOBackend(
+        handler_id="test",
+        dto_factory=dto_factory,
+        field_definition=FieldDefinition.from_annotation(list[DC]),
+        model_type=DC,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    field_definition = FieldDefinition.from_annotation(backend.annotation)
+    assert field_definition.origin is list
+    assert field_definition.has_inner_subclass_of(Struct)
+
+
+def test_backend_scalar_annotation(dto_factory: type[DataclassDTO], backend_cls: type[DTOBackend]) -> None:
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=dto_factory,
+        field_definition=FieldDefinition.from_annotation(DC),
+        model_type=DC,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    assert FieldDefinition.from_annotation(backend.annotation).is_subclass_of(Struct)
+
+
+def test_backend_populate_data_from_builtins(
+    dto_factory: type[DataclassDTO], asgi_connection: Request[Any, Any, Any], backend_cls: type[DTOBackend]
+) -> None:
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=dto_factory,
+        field_definition=FieldDefinition.from_annotation(DC),
+        model_type=DC,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    data = backend.populate_data_from_builtins(builtins=DESTRUCTURED, asgi_connection=asgi_connection)
+    assert data == STRUCTURED
+
+
+def test_backend_create_openapi_schema(dto_factory: type[DataclassDTO]) -> None:
+    @post("/", dto=dto_factory, name="test")
+    def handler(data: DC) -> DC:
+        return data
+
+    app = Litestar(route_handlers=[handler])
+
+    creator = SchemaCreator(plugins=app.plugins.openapi)
+    ref = dto_factory.create_openapi_schema(
+        handler_id=app.get_handler_index_by_name("test")["handler"].handler_id,  # type: ignore[index]
+        field_definition=FieldDefinition.from_annotation(DC),
+        schema_creator=creator,
+    )
+    schemas = creator.schema_registry.generate_components_schemas()
+    assert isinstance(ref, Reference)
+    schema = schemas[ref.value]
+    assert schema.title == "HandlerDCResponseBody"
+    assert schema.properties is not None
+    a, b, c = schema.properties["a"], schema.properties["b"], schema.properties["c"]
+    assert isinstance(a, Schema)
+    assert a.type == "integer"
+    assert isinstance(b, Schema)
+    assert b.type == "string"
+    assert isinstance(c, Schema)
+    assert c.type == "array"
+    assert isinstance(c.items, Schema)
+    assert c.items.type == "integer"
+    assert isinstance(nested := schema.properties["nested"], Reference)  # noqa: RUF018
+    nested_schema = schemas[nested.value]
+    assert nested_schema.title == "HandlerDCNestedDCResponseBody"
+    assert nested_schema.properties is not None
+    nested_a, nested_b = nested_schema.properties["a"], nested_schema.properties["b"]
+    assert isinstance(nested_a, Schema)
+    assert nested_a.type == "integer"
+    assert isinstance(nested_b, Schema)
+    assert nested_b.type == "string"
+
+
+def test_backend_model_name_uniqueness(dto_factory: type[DataclassDTO], backend_cls: type[DTOBackend]) -> None:
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=dto_factory,
+        field_definition=FieldDefinition.from_annotation(DC),
+        model_type=DC,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    backend._seen_model_names.clear()
+    unique_names: set = set()
+
+    field_definition = TransferDTOFieldDefinition.from_dto_field_definition(
+        field_definition=DTOFieldDefinition.from_field_definition(
+            field_definition=FieldDefinition.from_kwarg(annotation=int, name="a"),
+            default_factory=None,
+            dto_field=DTOField(),
+            model_name="some_module.SomeModel",
+        ),
+        serialization_name="a",
+        transfer_type=SimpleType(field_definition=FieldDefinition.from_annotation(int), nested_field_info=None),
+        is_partial=False,
+        is_excluded=False,
+    )
+
+    for _ in range(100):
+        model_class = backend.create_transfer_model_type("some_module.SomeModel", field_definitions=(field_definition,))
+        unique_names.add(model_class.__name__)
+
+    assert len(unique_names) == 100
+    assert backend._seen_model_names == unique_names
+
+
+def test_backend_populate_data_from_raw(
+    dto_factory: type[DataclassDTO], asgi_connection: Request[Any, Any, Any], backend_cls: type[DTOBackend]
+) -> None:
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=dto_factory,
+        field_definition=FieldDefinition.from_annotation(DC),
+        model_type=DC,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    data = backend.populate_data_from_raw(RAW, asgi_connection)
+    assert data == STRUCTURED
+
+
+def test_backend_populate_collection_data_from_raw(
+    dto_factory: type[DataclassDTO], asgi_connection: Request[Any, Any, Any], backend_cls: type[DTOBackend]
+) -> None:
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=dto_factory,
+        field_definition=FieldDefinition.from_annotation(list[DC]),
+        model_type=DC,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    data = backend.populate_data_from_raw(COLLECTION_RAW, asgi_connection)
+    assert data == [STRUCTURED]
+
+
+def test_backend_encode_data(
+    dto_factory: type[DataclassDTO], asgi_connection: Request[Any, Any, Any], backend_cls: type[DTOBackend]
+) -> None:
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=dto_factory,
+        field_definition=FieldDefinition.from_annotation(DC),
+        model_type=DC,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    data = backend.encode_data(STRUCTURED)
+    assert encode_json(data) == RAW
+
+
+def test_backend_encode_collection_data(
+    dto_factory: type[DataclassDTO], asgi_connection: Request[Any, Any, Any], backend_cls: type[DTOBackend]
+) -> None:
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=dto_factory,
+        field_definition=FieldDefinition.from_annotation(list[DC]),
+        model_type=DC,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    data = backend.encode_data([STRUCTURED])
+    assert encode_json(data) == COLLECTION_RAW
+
+
+def test_backend_encode_optional_nested_none(backend_cls: type[DTOBackend]) -> None:
+    """Encoding a model with an optional nested field set to None should not crash."""
+
+    class OuterDTO(DataclassDTO[OptionalNestedOuter]):
+        config = DTOConfig()
+
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=OuterDTO,
+        field_definition=FieldDefinition.from_annotation(OptionalNestedOuter),
+        model_type=OptionalNestedOuter,
+        wrapper_attribute_name=None,
+        is_data_field=False,
+    )
+    data = backend.encode_data(OptionalNestedOuter(name="test", inner=None))
+    result = to_builtins(data)
+    assert result["name"] == "test"
+    assert result["inner"] is None
+
+
+def test_transfer_only_touches_included_attributes(backend_cls: type[DTOBackend]) -> None:
+    """Ensure attribute that are not included are never touched in any way during
+    transfer.
+
+    https://github.com/litestar-org/litestar/issues/2125
+    """
+    mock = MagicMock()
+
+    @dataclass()
+    class Foo:
+        id: str
+        bar: str = ""
+
+    class Factory(DataclassDTO):
+        config = DTOConfig(include={"id"})
+
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=Factory,
+        field_definition=TransferDTOFieldDefinition.from_annotation(Foo),
+        model_type=Foo,
+        wrapper_attribute_name=None,
+        is_data_field=False,
+    )
+
+    Foo.bar = property(fget=lambda s: mock(return_value=""), fset=lambda s, v: None)  # type: ignore[assignment]
+
+    backend.encode_data(Foo(id="1"))
+    assert mock.call_count == 0
+
+
+def test_custom_attribute_accessor(backend_cls: type[DTOBackend]) -> None:
+    mock = MagicMock()
+
+    @dataclass()
+    class Foo:
+        id: str
+        bar: str = ""
+
+    def my_getattr(obj: object, attr: str) -> Any:
+        mock(attr)
+        return getattr(obj, attr)
+
+    class MyDataclassDTO(DataclassDTO):
+        attribute_accessor = my_getattr  # type: ignore[assignment]
+
+    class Factory(MyDataclassDTO):
+        config = DTOConfig(include={"id"})
+
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=Factory,
+        field_definition=TransferDTOFieldDefinition.from_annotation(Foo),
+        model_type=Foo,
+        wrapper_attribute_name=None,
+        is_data_field=False,
+    )
+
+    backend.encode_data(Foo(id="1"))
+    mock.assert_called_once_with("id")
+
+
+def test_codegen_attribute_accessor_not_used_when_default() -> None:
+    # when no custom 'attribute_accessor' is used, we expect the logic to be skipped
+    # entirely, and plain 'obj.value' attribute access to be performed, as this is more
+    # performant than using the default 'getattr'
+
+    @dataclass()
+    class Foo:
+        some_field: str
+
+    class Factory(DataclassDTO):
+        config = DTOConfig()
+
+    backend = DTOCodegenBackend(
+        handler_id="test",
+        dto_factory=Factory,
+        field_definition=TransferDTOFieldDefinition.from_annotation(Foo),
+        model_type=Foo,
+        wrapper_attribute_name=None,
+        is_data_field=False,
+    )
+
+    to_model_source = inspect.getsource(backend._transfer_to_model_type)
+    encode_source = inspect.getsource(backend._encode_data)
+
+    assert ".some_field" in to_model_source
+    assert ".some_field" in encode_source
+    assert "__getattr_impl" not in to_model_source
+    assert "__getattr_impl" not in encode_source
+
+
+def test_parse_model_nested_exclude(create_module: Callable[[str], ModuleType], backend_cls: type[DTOBackend]) -> None:
+    module = create_module(
+        """
+from dataclasses import dataclass
+from typing import List
+
+from litestar.dto import DataclassDTO
+
+@dataclass
+class NestedNestedModel:
+    e: int
+    f: int
+
+@dataclass
+class NestedModel:
+    c: int
+    d: list[NestedNestedModel]
+
+@dataclass
+class Model:
+    a: int
+    b: NestedModel
+
+dto_type = DataclassDTO[Model]
+    """
+    )
+
+    class Factory(DataclassDTO):
+        config = DTOConfig(max_nested_depth=2, exclude={"a", "b.c", "b.d.0.e"})
+
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=Factory,
+        field_definition=FieldDefinition.from_annotation(module.Model),
+        model_type=module.Model,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    parsed = backend.parsed_field_definitions
+    assert next(f for f in parsed if f.name == "a").is_excluded
+    assert parsed[1].name == "b"
+    b_transfer_type = parsed[1].transfer_type
+    assert isinstance(b_transfer_type, SimpleType)
+    b_nested_info = b_transfer_type.nested_field_info
+    assert b_nested_info is not None
+    assert next(f for f in b_nested_info.field_definitions if f.name == "c").is_excluded
+    assert b_nested_info.field_definitions[1].name == "d"
+    b_d_transfer_type = b_nested_info.field_definitions[1].transfer_type
+    assert isinstance(b_d_transfer_type, CollectionType)
+    assert isinstance(b_d_transfer_type.inner_type, SimpleType)
+    b_d_nested_info = b_d_transfer_type.inner_type.nested_field_info
+    assert b_d_nested_info is not None
+    assert next(f for f in b_d_nested_info.field_definitions if f.name == "e").is_excluded
+    assert b_d_nested_info.field_definitions[1].name == "f"
+
+
+def test_parse_model_nested_include(create_module: Callable[[str], ModuleType], backend_cls: type[DTOBackend]) -> None:
+    module = create_module(
+        """
+from dataclasses import dataclass
+from typing import List
+
+from litestar.dto import DataclassDTO
+
+@dataclass
+class NestedNestedModel:
+    e: int
+    f: int
+
+@dataclass
+class NestedModel:
+    c: int
+    d: list[NestedNestedModel]
+
+@dataclass
+class Model:
+    a: int
+    b: NestedModel
+
+dto_type = DataclassDTO[Model]
+    """
+    )
+
+    class Factory(DataclassDTO):
+        config = DTOConfig(max_nested_depth=2, include={"a", "b.c", "b.d.0.e"})
+
+    backend = backend_cls(
+        handler_id="test",
+        dto_factory=Factory,
+        field_definition=FieldDefinition.from_annotation(module.Model),
+        model_type=module.Model,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+    parsed = backend.parsed_field_definitions
+    assert not next(f for f in parsed if f.name == "a").is_excluded
+    assert parsed[1].name == "b"
+    b_transfer_type = parsed[1].transfer_type
+    assert isinstance(b_transfer_type, SimpleType)
+    b_nested_info = b_transfer_type.nested_field_info
+    assert b_nested_info is not None
+    assert not next(f for f in b_nested_info.field_definitions if f.name == "c").is_excluded
+    assert b_nested_info.field_definitions[1].name == "d"
+    b_d_transfer_type = b_nested_info.field_definitions[1].transfer_type
+    assert isinstance(b_d_transfer_type, CollectionType)
+    assert isinstance(b_d_transfer_type.inner_type, SimpleType)
+    b_d_nested_info = b_d_transfer_type.inner_type.nested_field_info
+    assert b_d_nested_info is not None
+    assert not next(f for f in b_d_nested_info.field_definitions if f.name == "e").is_excluded
+    assert b_d_nested_info.field_definitions[1].name == "f"
+
+
+@pytest.mark.parametrize(
+    ("constraint_kwargs",),
+    (
+        ({},),
+        ({"gt": 0, "lt": 2},),
+        ({"ge": 0, "le": 2},),
+        ({"min_length": 1, "max_length": 2},),
+        ({"pattern": "test"},),
+    ),
+)
+def test_create_struct_field_meta_for_field_definition(constraint_kwargs: Any) -> None:
+    mock_field = MagicMock(spec=TransferDTOFieldDefinition, is_partial=False)
+    mock_field.kwarg_definition = KwargDefinition(
+        description="test",
+        examples=[Example(value=1)],
+        title="test",
+        **constraint_kwargs,
+    )
+    assert _create_struct_field_meta_for_field_definition(mock_field) == Meta(
+        description="test",
+        examples=[1],
+        title="test",
+        **constraint_kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    "simple_type, value",
+    [
+        ("None", [{"value": "hello"}]),
+        ("None", None),
+        ("None,int", None),
+        ("None,int", 1),
+        ("None,int", [{"value": "hello"}]),
+        ("int", [{"value": "hello"}]),
+        ("int", 1),
+        ("bool", [{"value": "hello"}]),
+        ("bool", True),
+        ("bool,str,int", True),
+        ("bool,str,int", 1),
+        ("bool,str,int", "hello"),
+        ("bool,str,int", [{"value": "hello"}]),
+        ("bool,Inner", {"value": "hello"}),
+        ("bool,Inner", [{"value": "hello"}]),
+        ("bool,Inner", True),
+    ],
+)
+def test_transfer_nested_simple_type_union(
+    asgi_connection: Request[Any, Any, Any],
+    create_module: Callable[[str], ModuleType],
+    simple_type: str,
+    value: Any,
+) -> None:
+    # https://github.com/litestar-org/litestar/issues/4273
+
+    module = create_module(f"""
+from typing import Union
+import msgspec
+
+class Inner(msgspec.Struct):
+    value: str
+
+class Outer(msgspec.Struct):
+    some_field: Union[{simple_type}, list[Inner]]
+""")
+
+    backend = DTOCodegenBackend(
+        handler_id="test",
+        dto_factory=MsgspecDTO[module.Outer],  # type: ignore[name-defined]
+        field_definition=TransferDTOFieldDefinition.from_annotation(module.Outer),
+        model_type=module.Outer,
+        wrapper_attribute_name=None,
+        is_data_field=True,
+    )
+
+    data = backend.populate_data_from_builtins({"some_field": value}, asgi_connection)
+    assert isinstance(data, module.Outer)
+    if isinstance(value, list):
+        assert data.some_field == msgspec.convert(value, type=list[module.Inner])  # type: ignore[name-defined]
+    elif isinstance(value, dict):
+        assert data.some_field == msgspec.convert(value, type=module.Inner)
+    else:
+        assert data.some_field == value
+
+
+def test_nested_union_with_multiple_composite_types_raises(
+    asgi_connection: Request[Any, Any, Any],
+    create_module: Callable[[str], ModuleType],
+) -> None:
+    module = create_module("""
+from typing import Union
+import dataclasses
+
+@dataclasses.dataclass
+class Inner:
+    value: str
+
+
+@dataclasses.dataclass
+class Outer:
+    some_field: Union[list[str], dict[str, str], Inner]
+""")
+
+    with pytest.raises(
+        RuntimeError,
+        match=re.escape(
+            "Multiple composite types within unions are not supported. Received: list[str], dict[str, str]"
+        ),
+    ):
+        DTOCodegenBackend(
+            handler_id="test",
+            dto_factory=DataclassDTO[module.Outer],  # type: ignore[name-defined]
+            field_definition=TransferDTOFieldDefinition.from_annotation(module.Outer),
+            model_type=module.Outer,
+            wrapper_attribute_name=None,
+            is_data_field=True,
+        )
