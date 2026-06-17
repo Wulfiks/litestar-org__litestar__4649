@@ -1,0 +1,12 @@
+{
+  "test_validation_mode": "subset",
+  "validation_test_files": [
+    "tests/unit/test_utils/test_sequence.py",
+    "tests/unit/test_utils/test_version.py",
+    "tests/unit/test_utils/test_path.py",
+    "tests/unit/test_datastructures/test_cookie.py",
+    "tests/unit/test_datastructures/test_state.py"
+  ],
+  "validation_test_file_count": 5,
+  "validation_tests_executed": 56
+}
